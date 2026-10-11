@@ -283,16 +283,21 @@ wait_and_download() {
 
 # GitHub's own errors (billing, runner problems) are annotations, not step logs.
 show_failure() {
-  local run_id="$1" job errors logs
-  for job in $(gh run view "$run_id" --json jobs --jq '.jobs[].databaseId' 2>/dev/null || true); do
-    errors=$(gh api "repos/{owner}/{repo}/check-runs/$job/annotations" \
-      --jq '.[] | select(.annotation_level == "failure") | .message' 2>/dev/null || true)
-    if [ -n "$errors" ]; then
-      echo "GitHub says:" >&2
-      printf '%s\n' "$errors" | sed 's/^/    /' >&2
-    fi
+  local run_id="$1" job errors="" logs="" _
+  # Annotations and logs can appear a few seconds after the run is marked failed.
+  for _ in 1 2 3 4; do
+    for job in $(gh run view "$run_id" --json jobs --jq '.jobs[].databaseId' 2>/dev/null || true); do
+      errors+=$(gh api "repos/{owner}/{repo}/check-runs/$job/annotations" \
+        --jq '.[] | select(.annotation_level == "failure") | .message' 2>/dev/null || true)
+    done
+    logs=$(gh run view "$run_id" --log-failed 2>/dev/null | tail -n 60 || true)
+    [ -n "$errors$logs" ] && break
+    sleep 5
   done
-  logs=$(gh run view "$run_id" --log-failed 2>/dev/null | tail -n 60 || true)
+  if [ -n "$errors" ]; then
+    echo "GitHub says:" >&2
+    printf '%s\n' "$errors" | sed 's/^/    /' >&2
+  fi
   if [ -n "$logs" ]; then
     echo "Last lines of the failing step:" >&2
     printf '%s\n' "$logs" >&2
