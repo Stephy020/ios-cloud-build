@@ -1,4 +1,4 @@
-# Tests ios-cloud on real Windows (Git Bash) and Linux machines.
+# Tests skydrop on real Windows (Git Bash) and Linux machines.
 # Everything except the final USB install to an iPhone is exercised.
 name: test
 
@@ -36,21 +36,21 @@ jobs:
           for t in git node npm gh cygpath winpty cmp mktemp du seq sed grep find; do
             printf '%-8s %s\n' "$t" "$(command -v "$t" || echo MISSING)"
           done
-          git config --global user.name "ios-cloud test"
+          git config --global user.name "skydrop test"
           git config --global user.email "test@example.com"
 
       - name: install.sh
         run: ./install.sh
 
-      - name: A new terminal finds ios-cloud
+      - name: A new terminal finds skydrop
         run: |
           # Git Bash opens an interactive login shell; ~/.bashrc must put the shim on PATH.
-          bash -lic 'command -v ios-cloud && ios-cloud version'
+          bash -lic 'command -v skydrop && skydrop version'
 
       - name: doctor
         run: |
           export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
-          ios-cloud doctor || echo "(doctor reported problems; expected here: no Apple installer and a CI token)"
+          skydrop doctor || echo "(doctor reported problems; expected here: no Apple installer and a CI token)"
 
       - name: init in a sample Expo project
         run: |
@@ -58,10 +58,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/sample" && cd "$RUNNER_TEMP/sample"
           echo '{"name":"sample","dependencies":{"expo":"~57.0.0"}}' > package.json
           echo '{"expo":{"name":"Sample","slug":"sample"}}' > app.json
-          ios-cloud init --dry-run --no-repo --no-dev-client
+          skydrop init --dry-run --no-repo --no-dev-client
           test ! -e .git
-          ios-cloud init --no-repo --no-dev-client
-          ios-cloud init --no-repo --no-dev-client   # second run must change nothing
+          skydrop init --no-repo --no-dev-client
+          skydrop init --no-repo --no-dev-client   # second run must change nothing
           test -f .github/workflows/ios-build.yml
           node -e 'const id = require("./app.json").expo.ios.bundleIdentifier; console.log("bundle id:", id); if (!/^com\.[a-z0-9]{1,39}\.sample$/.test(id || "")) process.exit(1)'
           grep -qx 'build/' .gitignore && grep -qx '/ios' .gitignore
@@ -71,14 +71,14 @@ jobs:
             echo "::error::files committed with non-LF endings"; git ls-files --eol; exit 1
           fi
 
-      - name: Download a real build (ios-cloud wait)
+      - name: Download a real build (skydrop wait)
         id: download
         run: |
           export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
           run_id=$(gh run list -R "$SAMPLE_REPO" --workflow ios-build.yml --status success -L 1 --json databaseId --jq '.[0].databaseId // empty')
           if [ -z "$run_id" ]; then echo "::notice::No successful build in $SAMPLE_REPO to download; skipping"; exit 0; fi
           git clone -q "https://github.com/$SAMPLE_REPO" "$RUNNER_TEMP/app" && cd "$RUNNER_TEMP/app"
-          ios-cloud wait "$run_id"
+          skydrop wait "$run_id"
           ls -l build/ios
           ipa=$(cat build/ios/.last)
           test -s "$ipa" && test -s "${ipa%.ipa}.bundle-id"
@@ -93,9 +93,9 @@ jobs:
           curl -fsSL "$url" -o "$HOME/bin/plumesign.exe"
           plumesign --version || true
           plumesign sign --help | head -n 20
-          ios-cloud doctor || true
+          skydrop doctor || true
           cd "$RUNNER_TEMP/app"
           # No Apple ID or iPhone here, so this must get as far as "please log in":
           # that proves the .exe ran, got a valid Windows path and unpacked the .ipa.
-          IOS_CLOUD_INSTALLER=plumesign ios-cloud install 2>&1 | tee install.log || true
+          SKYDROP_INSTALLER=plumesign skydrop install 2>&1 | tee install.log || true
           grep -q "No account selected" install.log

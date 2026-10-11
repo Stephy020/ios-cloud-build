@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# ios-cloud: build iOS apps on a free GitHub Mac (no Apple Developer Program needed),
-# then sign and install them on your iPhone with a free Apple ID.
+# Skydrop: build your iPhone app in the cloud and drop it onto your phone.
+# Builds on a free GitHub Mac (no Apple Developer Program), then signs and installs
+# the app with a free Apple ID.
 # Works in Linux bash and in Windows Git Bash.
 set -euo pipefail
 
-VERSION="0.1.0"
-IOS_CLOUD_HOME="${IOS_CLOUD_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+VERSION="0.2.0"
+SKYDROP_HOME="${SKYDROP_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 WORKFLOW_FILE="ios-build.yml"
 WORKFLOW_PATH=".github/workflows/$WORKFLOW_FILE"
-TEMPLATE="$IOS_CLOUD_HOME/templates/$WORKFLOW_FILE"
+TEMPLATE="$SKYDROP_HOME/templates/$WORKFLOW_FILE"
 OUT_DIR="build/ios"
 DRY_RUN=0
 
@@ -40,7 +41,7 @@ act() {
 
 # Retry flaky network commands (phone hotspots drop connections).
 retry() {
-  local attempt=1 max="${IOS_CLOUD_RETRIES:-3}"
+  local attempt=1 max="${SKYDROP_RETRIES:-3}"
   until "$@"; do
     [ "$attempt" -ge "$max" ] && return 1
     warn "Failed (attempt $attempt/$max), retrying in 5s: $*"
@@ -201,7 +202,7 @@ use_noreply_email() {
 # ------------------------------------------------------------- installers ---
 
 find_plumesign() {
-  if [ -n "${IOS_CLOUD_PLUMESIGN:-}" ]; then printf '%s\n' "$IOS_CLOUD_PLUMESIGN"; return 0; fi
+  if [ -n "${SKYDROP_PLUMESIGN:-}" ]; then printf '%s\n' "$SKYDROP_PLUMESIGN"; return 0; fi
   local name
   for name in plumesign plumesign-windows-x86_64 plumesign-windows-arm64 plumesign-windows-x86; do
     if have "$name"; then command -v "$name"; return 0; fi
@@ -214,7 +215,7 @@ wsl_has_xtool() {
 }
 
 pick_installer() {
-  if [ -n "${IOS_CLOUD_INSTALLER:-}" ]; then echo "$IOS_CLOUD_INSTALLER"
+  if [ -n "${SKYDROP_INSTALLER:-}" ]; then echo "$SKYDROP_INSTALLER"
   elif have xtool; then echo xtool
   elif find_plumesign >/dev/null; then echo plumesign
   elif wsl_has_xtool; then echo wsl
@@ -229,10 +230,10 @@ manual_install() {
   echo "Your app is ready: $(native_path "$ipa")"
   if is_windows; then
     echo "Install it with Impactor: open Impactor, sign in with your Apple ID, and drag this .ipa onto it."
-    echo "Or put Impactor's plumesign.exe in ~/bin and run: ios-cloud install"
+    echo "Or put Impactor's plumesign.exe in ~/bin and run: skydrop install"
     explorer.exe "$(native_path "$dir")" >/dev/null 2>&1 || true
   else
-    echo "Install xtool (https://xtool.sh), then run: ios-cloud install"
+    echo "Install xtool (https://xtool.sh), then run: skydrop install"
   fi
 }
 
@@ -261,7 +262,7 @@ wait_and_download() {
   url=$(gh run view "$run_id" --json url --jq .url 2>/dev/null || echo "run $run_id")
   info "Build: $url"
   echo "${DIM}   A native build usually takes 10-25 min. Ctrl+C stops watching (the build keeps going);"
-  echo "   resume with: ios-cloud wait $run_id${RESET}"
+  echo "   resume with: skydrop wait $run_id${RESET}"
   start=$(date +%s)
   while :; do
     if line=$(gh run view "$run_id" --json status,conclusion,jobs --jq \
@@ -316,7 +317,7 @@ download_artifact() {
   info "Downloading the app"
   # Start from an empty folder on every attempt so a half-finished download can't block a retry.
   _download() { rm -rf "${tmp:?}"/*; gh run download "$run_id" --pattern 'ios-*' --dir "$tmp"; }
-  retry _download || die "Download failed. Try again with: ios-cloud wait $run_id"
+  retry _download || die "Download failed. Try again with: skydrop wait $run_id"
   ipa=$(find "$tmp" -name '*.ipa' | head -n1)
   [ -n "$ipa" ] || die "The build didn't produce an .ipa"
   mkdir -p "$OUT_DIR"
@@ -340,7 +341,7 @@ dev_hint() {
 
 cmd_init() {
   local visibility=public dev_client=1 create_repo=1 force=0 new_repo=0 is_expo=0
-  local message="Add iOS cloud build (ios-cloud)" name f files=()
+  local message="Add Skydrop iOS build" name f files=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --private) visibility=private ;;
@@ -355,10 +356,10 @@ cmd_init() {
     shift
   done
 
-  [ -f package.json ] || die "No package.json here. Run 'ios-cloud init' inside your app's folder."
+  [ -f package.json ] || die "No package.json here. Run 'skydrop init' inside your app's folder."
   have git || die "git is not installed."
   have node || die "Node.js is not installed."
-  [ -f "$TEMPLATE" ] || die "Workflow template missing: $TEMPLATE (reinstall ios-cloud-build)"
+  [ -f "$TEMPLATE" ] || die "Workflow template missing: $TEMPLATE (reinstall skydrop)"
   if has_dep expo; then is_expo=1; fi
   if [ "$is_expo" = 0 ] && [ ! -d ios ]; then
     die "This isn't an Expo project and has no ios/ folder, so there's nothing to build."
@@ -425,8 +426,8 @@ cmd_init() {
 
   echo
   ok "Ready! Build and install with:"
-  echo "    ios-cloud run release   # standalone app"
-  echo "    ios-cloud run dev       # development build, then: npx expo start"
+  echo "    skydrop run release   # standalone app"
+  echo "    skydrop run dev       # development build, then: npx expo start"
 }
 
 cmd_build() {
@@ -436,8 +437,8 @@ cmd_build() {
   cd "$root"
   have git || die "git is not installed."
   need_gh
-  [ -f "$WORKFLOW_PATH" ] || die "This project isn't set up yet. Run: ios-cloud init"
-  git remote get-url origin >/dev/null 2>&1 || die "No GitHub remote 'origin'. Run: ios-cloud init"
+  [ -f "$WORKFLOW_PATH" ] || die "This project isn't set up yet. Run: skydrop init"
+  git remote get-url origin >/dev/null 2>&1 || die "No GitHub remote 'origin'. Run: skydrop init"
   branch=$(git rev-parse --abbrev-ref HEAD)
   [ "$branch" != HEAD ] || die "You're not on a branch (detached HEAD). Check out a branch first."
 
@@ -477,7 +478,7 @@ cmd_build() {
 
 cmd_wait() {
   local run_id="${1:-}" root
-  [ -n "$run_id" ] || die "Usage: ios-cloud wait <run-id>"
+  [ -n "$run_id" ] || die "Usage: skydrop wait <run-id>"
   root=$(project_root)
   cd "$root"
   need_gh
@@ -489,7 +490,7 @@ cmd_install() {
   if [ -z "$ipa" ]; then
     root=$(project_root)
     cd "$root"
-    ipa=$(latest_ipa) || die "No .ipa found in $OUT_DIR. Run: ios-cloud build"
+    ipa=$(latest_ipa) || die "No .ipa found in $OUT_DIR. Run: skydrop build"
   fi
   [ -f "$ipa" ] || die "File not found: $ipa"
   installer=$(pick_installer)
@@ -512,7 +513,7 @@ cmd_install() {
       return 0
       ;;
     *)
-      die "Unknown IOS_CLOUD_INSTALLER=$installer (use xtool, plumesign, wsl or manual)"
+      die "Unknown SKYDROP_INSTALLER=$installer (use xtool, plumesign, wsl or manual)"
       ;;
   esac
   ok "Installed. First time? On the iPhone: Settings > General > VPN & Device Management > trust your Apple ID."
@@ -531,8 +532,8 @@ cmd_run() {
 cmd_doctor() {
   local problems=0 installer devices os login
   if is_windows; then os="Windows (Git Bash)"; else os=$(uname -s); fi
-  echo "${BOLD}ios-cloud $VERSION${RESET} on $os"
-  echo "${DIM}toolkit: $IOS_CLOUD_HOME${RESET}"
+  echo "${BOLD}skydrop $VERSION${RESET} on $os"
+  echo "${DIM}toolkit: $SKYDROP_HOME${RESET}"
 
   if have git; then ok "git $(git --version | awk '{print $3}')"; else fail "git is missing"; problems=$((problems + 1)); fi
   if have node; then ok "Node.js $(node --version)"; else
@@ -571,15 +572,15 @@ cmd_doctor() {
       warn "No installer found. Linux: install xtool (https://xtool.sh)."
       warn "Windows: download plumesign from https://github.com/claration/Impactor/releases, save it as ~/bin/plumesign.exe"
       ;;
-    *) fail "Unknown IOS_CLOUD_INSTALLER=$installer"; problems=$((problems + 1)) ;;
+    *) fail "Unknown SKYDROP_INSTALLER=$installer"; problems=$((problems + 1)) ;;
   esac
 
   if [ -f package.json ]; then
     if [ -f "$WORKFLOW_PATH" ]; then
       ok "This project is set up ($WORKFLOW_PATH)"
-      cmp -s "$TEMPLATE" "$WORKFLOW_PATH" || warn "Its workflow differs from the toolkit's template (ios-cloud update can refresh it)"
+      cmp -s "$TEMPLATE" "$WORKFLOW_PATH" || warn "Its workflow differs from the toolkit's template (skydrop update can refresh it)"
     else
-      warn "This project isn't set up yet. Run: ios-cloud init"
+      warn "This project isn't set up yet. Run: skydrop init"
     fi
     if git remote get-url origin >/dev/null 2>&1; then ok "GitHub repo: $(git remote get-url origin)"; fi
   fi
@@ -589,9 +590,9 @@ cmd_doctor() {
 }
 
 cmd_update() {
-  info "Updating ios-cloud in $IOS_CLOUD_HOME"
-  retry git -C "$IOS_CLOUD_HOME" pull -q --ff-only || die "Update failed."
-  ok "Toolkit is up to date ($(git -C "$IOS_CLOUD_HOME" log -1 --format='%h %s'))"
+  info "Updating skydrop in $SKYDROP_HOME"
+  retry git -C "$SKYDROP_HOME" pull -q --ff-only || die "Update failed."
+  ok "Toolkit is up to date ($(git -C "$SKYDROP_HOME" log -1 --format='%h %s'))"
   if [ -f "$WORKFLOW_PATH" ] && ! cmp -s "$TEMPLATE" "$WORKFLOW_PATH"; then
     warn "This project's $WORKFLOW_PATH differs from the toolkit's version."
     if confirm "Replace it with the toolkit's version?"; then
@@ -603,9 +604,10 @@ cmd_update() {
 
 usage() {
   cat <<EOF
-ios-cloud $VERSION: build iOS apps on a free GitHub Mac, install them with a free Apple ID.
+Skydrop $VERSION: build your iPhone app in the cloud and drop it onto your phone.
+No Mac, no paid Apple Developer account.
 
-Usage: ios-cloud <command> [options]
+Usage: skydrop <command> [options]
 
   init [--private] [--no-dev-client] [--no-repo] [--force] [--dry-run] [-m msg]
                         Set up the current Expo/React Native project and its GitHub repo
@@ -621,9 +623,9 @@ release = standalone app with the JavaScript inside.
 dev     = Expo development build; after installing, run 'npx expo start' and edit live.
 
 Environment:
-  IOS_CLOUD_INSTALLER   xtool | plumesign | wsl | manual (default: first one found)
-  IOS_CLOUD_PLUMESIGN   path to plumesign(.exe) if it isn't on PATH
-  IOS_CLOUD_RETRIES     network retries (default 3)
+  SKYDROP_INSTALLER   xtool | plumesign | wsl | manual (default: first one found)
+  SKYDROP_PLUMESIGN   path to plumesign(.exe) if it isn't on PATH
+  SKYDROP_RETRIES     network retries (default 3)
 EOF
 }
 
@@ -638,7 +640,7 @@ main() {
     install) cmd_install "$@" ;;
     doctor) cmd_doctor "$@" ;;
     update) cmd_update "$@" ;;
-    version|--version|-v) echo "ios-cloud $VERSION" ;;
+    version|--version|-v) echo "skydrop $VERSION" ;;
     help|--help|-h) usage ;;
     *) fail "Unknown command: $cmd"; echo; usage; exit 1 ;;
   esac
