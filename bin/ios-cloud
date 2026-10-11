@@ -236,16 +236,21 @@ manual_install() {
 }
 
 launch_app() {
-  local ipa="$1" bid_file bid
+  local ipa="$1" bid_file bid team id
   bid_file="${ipa%.ipa}.bundle-id"
   [ "$(pick_installer)" = xtool ] && [ -f "$bid_file" ] || return 0
   bid=$(cat "$bid_file")
-  info "Launching $bid"
-  if xtool launch "$bid" >/dev/null 2>&1; then
-    ok "App launched on your iPhone"
-  else
-    warn "Couldn't launch it automatically. Open it from your iPhone's home screen."
-  fi
+  # With a free Apple ID, xtool installs the app as XTL-<team ID>.<bundle ID>.
+  team=$(xtool auth status 2>/dev/null | sed -n 's/^- Team ID: //p' | head -n1)
+  for id in ${team:+"XTL-$team.$bid"} "$bid"; do
+    info "Launching $id"
+    if xtool launch "$id" >/dev/null 2>&1; then
+      ok "App launched on your iPhone"
+      return 0
+    fi
+  done
+  warn "Couldn't launch it automatically. Open it from your iPhone's home screen."
+  warn "(First time? Trust your Apple ID first: Settings > General > VPN & Device Management.)"
 }
 
 # --------------------------------------------------------------- builds -----
