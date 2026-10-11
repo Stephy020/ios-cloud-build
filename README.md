@@ -125,6 +125,7 @@ Environment variables for the `ios-cloud` command:
 ## Troubleshooting
 
 - **Build failed:** `ios-cloud` prints the last lines of the failing step and a link to the full log. The full Xcode log is also attached to the run as `xcodebuild-log-*`.
+- **"The job was not started because your account is locked due to a billing issue":** GitHub blocks *all* Actions, even free ones on public repos, until the billing problem is fixed. Open https://github.com/settings/billing and fix the payment method, pay or cancel the overdue charge, or cancel any paid plan or trial. Then start the build again.
 - **`refusing to allow an OAuth App to create or update workflow`:** run `gh auth refresh -s workflow`.
 - **The app won't open:** turn on Developer Mode and trust your Apple ID (see above), or the 7 days ran out (run `ios-cloud install`).
 - **Windows: plumesign can't ask for input in Git Bash:** ios-cloud runs it through `winpty` automatically. If it still fails, run the same command in Windows Terminal.

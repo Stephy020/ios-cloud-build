@@ -273,13 +273,30 @@ wait_and_download() {
   done
 
   if [ "$conclusion" != success ]; then
-    fail "Build ${conclusion:-failed} after $(elapsed "$start")."
-    echo "Last lines of the failing step:" >&2
-    gh run view "$run_id" --log-failed 2>/dev/null | tail -n 60 >&2 || true
+    fail "Build didn't succeed (${conclusion:-unknown}) after $(elapsed "$start")."
+    show_failure "$run_id"
     die "Full log: $url"
   fi
   ok "Build finished in $(elapsed "$start")"
   download_artifact "$run_id"
+}
+
+# GitHub's own errors (billing, runner problems) are annotations, not step logs.
+show_failure() {
+  local run_id="$1" job errors logs
+  for job in $(gh run view "$run_id" --json jobs --jq '.jobs[].databaseId' 2>/dev/null || true); do
+    errors=$(gh api "repos/{owner}/{repo}/check-runs/$job/annotations" \
+      --jq '.[] | select(.annotation_level == "failure") | .message' 2>/dev/null || true)
+    if [ -n "$errors" ]; then
+      echo "GitHub says:" >&2
+      printf '%s\n' "$errors" | sed 's/^/    /' >&2
+    fi
+  done
+  logs=$(gh run view "$run_id" --log-failed 2>/dev/null | tail -n 60 || true)
+  if [ -n "$logs" ]; then
+    echo "Last lines of the failing step:" >&2
+    printf '%s\n' "$logs" >&2
+  fi
 }
 
 download_artifact() {
