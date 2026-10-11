@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+# ios-cloud: build iOS apps on a free GitHub Mac (no Apple Developer Program needed),
+# then sign and install them on your iPhone with a free Apple ID.
+# Works in Linux bash and in Windows Git Bash.
+set -euo pipefail
+
+VERSION="0.1.0"
+IOS_CLOUD_HOME="${IOS_CLOUD_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+WORKFLOW_FILE="ios-build.yml"
+WORKFLOW_PATH=".github/workflows/$WORKFLOW_FILE"
+TEMPLATE="$IOS_CLOUD_HOME/templates/$WORKFLOW_FILE"
+OUT_DIR="build/ios"
+DRY_RUN=0
+
+if [ -t 1 ]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RESET=$'\033[0m'
+else
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; RESET=""
+fi
+
+info() { printf '%s==>%s %s\n' "$BOLD" "$RESET" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+fail() { printf '%s✗%s %s\n' "$RED" "$RESET" "$*" >&2; }
+die()  { fail "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+is_windows() {
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac
+}
+
+# Run a command, or only print it with --dry-run.
+act() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '%s[dry-run]%s %s\n' "$DIM" "$RESET" "$*"
+    return 0
+  fi
+  "$@"
+}
+
+# Retry flaky network commands (phone hotspots drop connections).
+retry() {
+  local attempt=1 max="${IOS_CLOUD_RETRIES:-3}"
+  until "$@"; do
+    [ "$attempt" -ge "$max" ] && return 1
+    warn "Failed (attempt $attempt/$max), retrying in 5s: $*"
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+}
+
+confirm() {
+  [ -t 0 ] || return 1
+  local answer
+  read -r -p "$1 [y/N] " answer
+  case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+elapsed() {
+  local s=$(( $(date +%s) - $1 ))
+  printf '%dm%02ds' $((s / 60)) $((s % 60))
+}
+
+# Path as the OS expects it (native Windows programs need C:\... paths).
+native_path() {
+  if is_windows && have cygpath; then cygpath -w "$1"; else printf '%s\n' "$1"; fi
+}
+
+# Native Windows programs can't read keyboard input inside mintty (Git Bash's
+# default window) unless they run through winpty.
+run_interactive() {
+  if is_windows && [ "${TERM_PROGRAM:-}" = mintty ] && [ -t 0 ] && have winpty; then
+    winpty "$@"
+  else
+    "$@"
+  fi
+}
+
+# ---------------------------------------------------------------- project ----
+
+project_root() {
+  local top
+  if [ -f package.json ]; then pwd; return 0; fi
+  top=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -n "$top" ] && [ -f "$top/package.json" ]; then printf '%s\n' "$top"; return 0; fi
+  die "No package.json here. Run this inside your app's folder."
+}
+
+has_dep() {
+  node -e '
+    const p = require("./package.json");
+    const deps = Object.assign({}, p.dependencies, p.devDependencies);
+    process.exit(deps[process.argv[1]] ? 0 : 1);
+  ' "$1"
+}
+
+# app.config.js/ts can compute the config, so ask Expo; otherwise app.json is enough.
+expo_bundle_id() {
+  if ls app.config.* >/dev/null 2>&1; then
+    npx --no-install expo config --json --type public 2>/dev/null | node -e '
+      let s = "";
+      process.stdin.on("data", (c) => (s += c)).on("end", () => {
+        try { process.stdout.write((JSON.parse(s).ios || {}).bundleIdentifier || ""); } catch (e) {}
+      });
+    ' || true
+  elif [ -f app.json ]; then
+    node -e '
+      try {
+        const j = require("./app.json");
+        process.stdout.write(((j.expo || j).ios || {}).bundleIdentifier || "");
+      } catch (e) {}
+    '
+  fi
+}
+
+normalize_profile() {
+  case "${1:-release}" in
+    release|prod|production) echo release ;;
+    dev|development|debug) echo dev ;;
+    *) die "Unknown profile '$1'. Use: release or dev" ;;
+  esac
+}
+
+latest_ipa() {
+  local f=""
+  if [ -f "$OUT_DIR/.last" ]; then
+    f=$(cat "$OUT_DIR/.last")
+    if [ -f "$f" ]; then printf '%s\n' "$f"; return 0; fi
+  fi
+  f=$(ls -t "$OUT_DIR"/*.ipa 2>/dev/null | head -n1 || true)
+  [ -n "$f" ] && printf '%s\n' "$f"
+}
+
+ensure_ignored() {
+  local pattern="$1" bare
+  bare="${pattern#/}"; bare="${bare%/}"
+  if [ -f .gitignore ] && grep -qE "^/?${bare//./\\.}/?\$" .gitignore; then return 0; fi
+  info "Adding '$pattern' to .gitignore"
+  if [ "$DRY_RUN" = 0 ]; then
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then echo >> .gitignore; fi
+    echo "$pattern" >> .gitignore
+  fi
+}
+
+ensure_bundle_id() {
+  local bid owner slug answer
+  bid=$(expo_bundle_id)
+  if [ -n "$bid" ]; then ok "Bundle identifier: $bid"; return 0; fi
+  [ -f app.json ] || die "Set ios.bundleIdentifier in your app config (e.g. \"com.yourname.myapp\"), then run init again."
+  owner=$(gh api user --jq .login 2>/dev/null || echo "${USER:-${USERNAME:-me}}")
+  owner=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
+  slug=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
+  bid="com.${owner:-me}.${slug:-app}"
+  if [ -t 0 ]; then
+    read -r -p "iOS bundle identifier [$bid]: " answer
+    bid="${answer:-$bid}"
+  fi
+  info "Setting ios.bundleIdentifier = $bid in app.json"
+  [ "$DRY_RUN" = 1 ] && return 0
+  node -e '
+    const fs = require("fs");
+    const j = JSON.parse(fs.readFileSync("app.json", "utf8"));
+    j.expo = j.expo || {};
+    j.expo.ios = j.expo.ios || {};
+    j.expo.ios.bundleIdentifier = process.argv[1];
+    fs.writeFileSync("app.json", JSON.stringify(j, null, 2) + "\n");
+  ' "$bid"
+}
+
+# --------------------------------------------------------------- github -----
+
+gh_hint() {
+  if is_windows; then
+    echo "Install it with: winget install --id GitHub.cli   (then reopen Git Bash)"
+  else
+    echo "Install it from https://github.com/cli/cli/releases (or: sudo apt install gh)"
+  fi
+}
+
+need_gh() {
+  have gh || die "GitHub CLI (gh) is not installed. $(gh_hint)"
+  gh auth status >/dev/null 2>&1 || die "Not logged in to GitHub. Run: gh auth login -s workflow"
+}
+
+gh_has_workflow_scope() { gh auth status 2>&1 | grep -q "'workflow'"; }
+
+# Public repos show commit emails to everyone, so use GitHub's no-reply address.
+use_noreply_email() {
+  local current addr
+  current=$(git config user.email 2>/dev/null || true)
+  case "$current" in *@users.noreply.github.com) return 0 ;; esac
+  addr=$(gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"' 2>/dev/null) || {
+    warn "Couldn't look up your GitHub no-reply email; commits will use '${current:-git default}'."
+    return 0
+  }
+  info "Public repo: commits in this project will use $addr (keeps your real email private)"
+  act git config user.email "$addr"
+}
+
+# ------------------------------------------------------------- installers ---
+
+find_plumesign() {
+  if [ -n "${IOS_CLOUD_PLUMESIGN:-}" ]; then printf '%s\n' "$IOS_CLOUD_PLUMESIGN"; return 0; fi
+  local name
+  for name in plumesign plumesign-windows-x86_64 plumesign-windows-arm64 plumesign-windows-x86; do
+    if have "$name"; then command -v "$name"; return 0; fi
+  done
+  return 1
+}
+
+wsl_has_xtool() {
+  is_windows && have wsl && MSYS_NO_PATHCONV=1 wsl -e sh -c 'command -v xtool' >/dev/null 2>&1
+}
+
+pick_installer() {
+  if [ -n "${IOS_CLOUD_INSTALLER:-}" ]; then echo "$IOS_CLOUD_INSTALLER"
+  elif have xtool; then echo xtool
+  elif find_plumesign >/dev/null; then echo plumesign
+  elif wsl_has_xtool; then echo wsl
+  else echo manual
+  fi
+}
+
+manual_install() {
+  local ipa="$1" dir
+  dir=$(cd "$(dirname "$ipa")" && pwd)
+  warn "No installer found (xtool, plumesign, or xtool inside WSL)."
+  echo "Your app is ready: $(native_path "$ipa")"
+  if is_windows; then
+    echo "Install it with Impactor: open Impactor, sign in with your Apple ID, and drag this .ipa onto it."
+    echo "Or put Impactor's plumesign.exe in ~/bin and run: ios-cloud install"
+    explorer.exe "$(native_path "$dir")" >/dev/null 2>&1 || true
+  else
+    echo "Install xtool (https://xtool.sh), then run: ios-cloud install"
+  fi
+}
+
+launch_app() {
+  local ipa="$1" bid_file bid
+  bid_file="${ipa%.ipa}.bundle-id"
+  [ "$(pick_installer)" = xtool ] && [ -f "$bid_file" ] || return 0
+  bid=$(cat "$bid_file")
+  info "Launching $bid"
+  if xtool launch "$bid" >/dev/null 2>&1; then
+    ok "App launched on your iPhone"
+  else
+    warn "Couldn't launch it automatically. Open it from your iPhone's home screen."
+  fi
+}
+
+# --------------------------------------------------------------- builds -----
+
+wait_and_download() {
+  local run_id="$1" url start line status="" conclusion="" step="" last=""
+  url=$(gh run view "$run_id" --json url --jq .url 2>/dev/null || echo "run $run_id")
+  info "Build: $url"
+  echo "${DIM}   A native build usually takes 10-25 min. Ctrl+C stops watching (the build keeps going);"
+  echo "   resume with: ios-cloud wait $run_id${RESET}"
+  start=$(date +%s)
+  while :; do
+    if line=$(gh run view "$run_id" --json status,conclusion,jobs --jq \
+        '[.status, (.conclusion // ""), ([.jobs[].steps[]? | select(.status == "in_progress") | .name][0] // "")] | join("\u001f")' 2>/dev/null); then
+      IFS=$'\x1f' read -r status conclusion step <<<"$line" || true
+      if [ -n "$step" ] && [ "$step" != "$last" ]; then
+        printf '   %s[%s]%s %s\n' "$DIM" "$(elapsed "$start")" "$RESET" "$step"
+        last="$step"
+      fi
+      [ "$status" = completed ] && break
+    else
+      warn "Can't reach GitHub right now, still waiting..."
+    fi
+    sleep 15
+  done
+
+  if [ "$conclusion" != success ]; then
+    fail "Build ${conclusion:-failed} after $(elapsed "$start")."
+    echo "Last lines of the failing step:" >&2
+    gh run view "$run_id" --log-failed 2>/dev/null | tail -n 60 >&2 || true
+    die "Full log: $url"
+  fi
+  ok "Build finished in $(elapsed "$start")"
+  download_artifact "$run_id"
+}
+
+download_artifact() {
+  local run_id="$1" tmp ipa dest
+  tmp=$(mktemp -d)
+  info "Downloading the app"
+  # Start from an empty folder on every attempt so a half-finished download can't block a retry.
+  _download() { rm -rf "${tmp:?}"/*; gh run download "$run_id" --pattern 'ios-*' --dir "$tmp"; }
+  retry _download || die "Download failed. Try again with: ios-cloud wait $run_id"
+  ipa=$(find "$tmp" -name '*.ipa' | head -n1)
+  [ -n "$ipa" ] || die "The build didn't produce an .ipa"
+  mkdir -p "$OUT_DIR"
+  dest="$OUT_DIR/$(basename "$ipa")"
+  mv -f "$ipa" "$dest"
+  if [ -f "${ipa%.ipa}.bundle-id" ]; then mv -f "${ipa%.ipa}.bundle-id" "${dest%.ipa}.bundle-id"; fi
+  printf '%s\n' "$dest" > "$OUT_DIR/.last"
+  rm -rf "$tmp"
+  ok "Saved $dest ($(du -h "$dest" | cut -f1))"
+}
+
+dev_hint() {
+  echo
+  info "Dev build installed. Start the JavaScript server on this PC:"
+  echo "    npx expo start"
+  echo "  then open the app on your iPhone and pick this PC's server."
+  echo "  If the iPhone can't see your PC (e.g. you're on its hotspot), use: npx expo start --tunnel"
+}
+
+# ------------------------------------------------------------- commands -----
+
+cmd_init() {
+  local visibility=public dev_client=1 create_repo=1 force=0 new_repo=0 is_expo=0
+  local message="Add iOS cloud build (ios-cloud)" name f files=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --private) visibility=private ;;
+      --public) visibility=public ;;
+      --no-dev-client) dev_client=0 ;;
+      --no-repo) create_repo=0 ;;
+      --force) force=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      -m|--message) shift; message="${1:?--message needs a value}" ;;
+      *) die "Unknown option for init: $1" ;;
+    esac
+    shift
+  done
+
+  [ -f package.json ] || die "No package.json here. Run 'ios-cloud init' inside your app's folder."
+  have git || die "git is not installed."
+  have node || die "Node.js is not installed."
+  [ -f "$TEMPLATE" ] || die "Workflow template missing: $TEMPLATE (reinstall ios-cloud-build)"
+  if has_dep expo; then is_expo=1; fi
+  if [ "$is_expo" = 0 ] && [ ! -d ios ]; then
+    die "This isn't an Expo project and has no ios/ folder, so there's nothing to build."
+  fi
+  if [ "$create_repo" = 1 ]; then need_gh; fi
+  [ "$DRY_RUN" = 1 ] && info "Dry run: nothing will be changed."
+
+  # 1. The app needs a bundle identifier before Expo can generate the iOS project.
+  if [ "$is_expo" = 1 ] && [ ! -d ios ]; then ensure_bundle_id; fi
+
+  # 2. Git repository.
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    info "Creating a git repository"
+    act git init -q -b main
+    new_repo=1
+  fi
+
+  # 3. Keep generated and downloaded files out of git.
+  ensure_ignored "node_modules/"
+  ensure_ignored "build/"
+  if [ "$is_expo" = 1 ] && [ ! -d ios ]; then ensure_ignored "/ios"; fi
+
+  # 4. The workflow the GitHub Mac runs.
+  if [ -f "$WORKFLOW_PATH" ] && ! cmp -s "$TEMPLATE" "$WORKFLOW_PATH" && [ "$force" = 0 ]; then
+    warn "$WORKFLOW_PATH already exists and differs from the template. Keeping it (use --force to replace)."
+  else
+    info "Writing $WORKFLOW_PATH"
+    act mkdir -p .github/workflows
+    act cp "$TEMPLATE" "$WORKFLOW_PATH"
+  fi
+
+  # 5. expo-dev-client makes "dev" builds possible.
+  if [ "$dev_client" = 1 ] && [ "$is_expo" = 1 ] && ! has_dep expo-dev-client; then
+    [ -d node_modules ] || die "Install your dependencies first (npm install), then run init again."
+    info "Adding expo-dev-client (needed for dev builds)"
+    act retry npx expo install expo-dev-client
+  fi
+
+  # 6. Commit.
+  if [ "$create_repo" = 1 ] && [ "$visibility" = public ]; then use_noreply_email; fi
+  if [ "$new_repo" = 1 ]; then
+    act git add -A
+  else
+    for f in .gitignore "$WORKFLOW_PATH" package.json app.json package-lock.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb; do
+      [ -e "$f" ] && files+=("$f")
+    done
+    act git add -- "${files[@]}"
+  fi
+  if [ "$DRY_RUN" = 1 ] || ! git diff --cached --quiet; then
+    act git commit -q -m "$message"
+  fi
+
+  # 7. GitHub repository.
+  if [ "$create_repo" = 1 ]; then
+    if git remote get-url origin >/dev/null 2>&1; then
+      info "Pushing to $(git remote get-url origin)"
+    else
+      name=$(basename "$PWD" | tr ' ' '-')
+      info "Creating $visibility GitHub repo '$name'"
+      act gh repo create "$name" "--$visibility" --source . --remote origin
+    fi
+    act retry git push -q -u origin HEAD
+  fi
+
+  echo
+  ok "Ready! Build and install with:"
+  echo "    ios-cloud run release   # standalone app"
+  echo "    ios-cloud run dev       # development build, then: npx expo start"
+}
+
+cmd_build() {
+  local profile root branch sha out run_id="" before id
+  profile=$(normalize_profile "${1:-release}")
+  root=$(project_root)
+  cd "$root"
+  have git || die "git is not installed."
+  need_gh
+  [ -f "$WORKFLOW_PATH" ] || die "This project isn't set up yet. Run: ios-cloud init"
+  git remote get-url origin >/dev/null 2>&1 || die "No GitHub remote 'origin'. Run: ios-cloud init"
+  branch=$(git rev-parse --abbrev-ref HEAD)
+  [ "$branch" != HEAD ] || die "You're not on a branch (detached HEAD). Check out a branch first."
+
+  if [ -n "$(git status --porcelain)" ]; then
+    warn "You have uncommitted changes. The cloud Mac builds what's committed, so they won't be included."
+    if [ "$profile" = dev ]; then
+      warn "(Fine for a dev build if you only changed JavaScript: it loads live from your PC.)"
+    fi
+  fi
+
+  info "Pushing '$branch' to GitHub"
+  retry git push -q -u origin "$branch" || die "git push failed."
+  sha=$(git rev-parse HEAD)
+  before=" $(gh run list --workflow "$WORKFLOW_FILE" --limit 20 --json databaseId --jq '.[].databaseId' 2>/dev/null | tr '\n' ' ' || true) "
+
+  info "Starting a $profile build on a GitHub Mac"
+  # Right after the first push GitHub can take a few seconds to see a new workflow, so retry.
+  out=$(retry gh workflow run "$WORKFLOW_FILE" --ref "$branch" -f profile="$profile" 2>&1) || {
+    printf '%s\n' "$out" >&2
+    die "Couldn't start the build. (The workflow file must also be on your repo's default branch.)"
+  }
+  run_id=$(printf '%s\n' "$out" | grep -oE 'actions/runs/[0-9]+' | head -n1 | cut -d/ -f3 || true)
+
+  # Older gh versions don't print the run, so find it: same commit, not seen before.
+  for _ in $(seq 1 40); do
+    [ -n "$run_id" ] && break
+    for id in $(gh run list --workflow "$WORKFLOW_FILE" --branch "$branch" --event workflow_dispatch --limit 10 \
+        --json databaseId,headSha --jq ".[] | select(.headSha == \"$sha\") | .databaseId" 2>/dev/null || true); do
+      case "$before" in *" $id "*) ;; *) run_id="$id"; break ;; esac
+    done
+    [ -n "$run_id" ] || sleep 3
+  done
+  [ -n "$run_id" ] || die "The build started, but I couldn't find it. See: gh run list --workflow $WORKFLOW_FILE"
+
+  wait_and_download "$run_id"
+}
+
+cmd_wait() {
+  local run_id="${1:-}" root
+  [ -n "$run_id" ] || die "Usage: ios-cloud wait <run-id>"
+  root=$(project_root)
+  cd "$root"
+  need_gh
+  wait_and_download "$run_id"
+}
+
+cmd_install() {
+  local ipa="${1:-}" root installer ps
+  if [ -z "$ipa" ]; then
+    root=$(project_root)
+    cd "$root"
+    ipa=$(latest_ipa) || die "No .ipa found in $OUT_DIR. Run: ios-cloud build"
+  fi
+  [ -f "$ipa" ] || die "File not found: $ipa"
+  installer=$(pick_installer)
+  info "Installing $(basename "$ipa") with $installer"
+  case "$installer" in
+    xtool)
+      xtool install "$ipa" || die "xtool install failed. Is the iPhone plugged in, unlocked and trusted? Check: xtool devices; xtool auth status"
+      ;;
+    plumesign)
+      ps=$(find_plumesign)
+      run_interactive "$ps" sign --package "$(native_path "$ipa")" --apple-id --register-and-install || die \
+        "plumesign failed. First time? Log in with: plumesign account login -u you@example.com (Windows also needs iTunes for the iPhone USB driver)"
+      ;;
+    wsl)
+      MSYS_NO_PATHCONV=1 wsl -e sh -c 'xtool install "$(wslpath -a "$1")"' sh "$(native_path "$ipa")" \
+        || die "xtool (in WSL) failed. Check inside WSL: xtool devices; xtool auth status"
+      ;;
+    manual)
+      manual_install "$ipa"
+      return 0
+      ;;
+    *)
+      die "Unknown IOS_CLOUD_INSTALLER=$installer (use xtool, plumesign, wsl or manual)"
+      ;;
+  esac
+  ok "Installed. First time? On the iPhone: Settings > General > VPN & Device Management > trust your Apple ID."
+}
+
+cmd_run() {
+  local profile ipa
+  profile=$(normalize_profile "${1:-release}")
+  cmd_build "$profile"
+  ipa=$(latest_ipa)
+  cmd_install "$ipa"
+  launch_app "$ipa"
+  if [ "$profile" = dev ]; then dev_hint; fi
+}
+
+cmd_doctor() {
+  local problems=0 installer devices os
+  if is_windows; then os="Windows (Git Bash)"; else os=$(uname -s); fi
+  echo "${BOLD}ios-cloud $VERSION${RESET} on $os"
+  echo "${DIM}toolkit: $IOS_CLOUD_HOME${RESET}"
+
+  if have git; then ok "git $(git --version | awk '{print $3}')"; else fail "git is missing"; problems=$((problems + 1)); fi
+  if have node; then ok "Node.js $(node --version)"; else
+    fail "Node.js is missing: https://nodejs.org (Windows: winget install OpenJS.NodeJS.LTS)"; problems=$((problems + 1))
+  fi
+  if ! have gh; then
+    fail "GitHub CLI is missing. $(gh_hint)"; problems=$((problems + 1))
+  elif ! gh auth status >/dev/null 2>&1; then
+    fail "GitHub CLI isn't logged in. Run: gh auth login -s workflow"; problems=$((problems + 1))
+  else
+    ok "GitHub: logged in as $(gh api user --jq .login 2>/dev/null || echo '?')"
+    if ! gh_has_workflow_scope; then
+      fail "Your GitHub login can't push workflow files. Run: gh auth refresh -s workflow"; problems=$((problems + 1))
+    fi
+  fi
+
+  installer=$(pick_installer)
+  case "$installer" in
+    xtool)
+      ok "Installer: xtool ($(xtool --version 2>/dev/null || echo '?'))"
+      if xtool auth status 2>/dev/null | grep -q '^Logged in'; then ok "xtool is logged in to your Apple ID"; else
+        fail "xtool isn't logged in. Run: xtool auth login"; problems=$((problems + 1))
+      fi
+      devices=$(xtool devices 2>/dev/null | grep -E '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}|[0-9a-f]{40}' || true)
+      if [ -n "$devices" ]; then ok "iPhone: $devices"; else warn "No iPhone found. Plug it in, unlock it and tap Trust."; fi
+      ;;
+    plumesign)
+      ok "Installer: plumesign ($(find_plumesign))"
+      if is_windows && ! sc.exe query "Apple Mobile Device Service" >/dev/null 2>&1; then
+        fail "Apple's iPhone USB driver isn't installed. Install iTunes from apple.com."; problems=$((problems + 1))
+      fi
+      ;;
+    wsl) ok "Installer: xtool inside WSL" ;;
+    manual)
+      warn "No installer found. Linux: install xtool (https://xtool.sh)."
+      warn "Windows: download plumesign from https://github.com/claration/Impactor/releases, save it as ~/bin/plumesign.exe"
+      ;;
+    *) fail "Unknown IOS_CLOUD_INSTALLER=$installer"; problems=$((problems + 1)) ;;
+  esac
+
+  if [ -f package.json ]; then
+    if [ -f "$WORKFLOW_PATH" ]; then
+      ok "This project is set up ($WORKFLOW_PATH)"
+      cmp -s "$TEMPLATE" "$WORKFLOW_PATH" || warn "Its workflow differs from the toolkit's template (ios-cloud update can refresh it)"
+    else
+      warn "This project isn't set up yet. Run: ios-cloud init"
+    fi
+    if git remote get-url origin >/dev/null 2>&1; then ok "GitHub repo: $(git remote get-url origin)"; fi
+  fi
+
+  echo
+  if [ "$problems" = 0 ]; then ok "All good."; else fail "$problems problem(s) to fix."; return 1; fi
+}
+
+cmd_update() {
+  info "Updating ios-cloud in $IOS_CLOUD_HOME"
+  retry git -C "$IOS_CLOUD_HOME" pull -q --ff-only || die "Update failed."
+  ok "Toolkit is up to date ($(git -C "$IOS_CLOUD_HOME" log -1 --format='%h %s'))"
+  if [ -f "$WORKFLOW_PATH" ] && ! cmp -s "$TEMPLATE" "$WORKFLOW_PATH"; then
+    warn "This project's $WORKFLOW_PATH differs from the toolkit's version."
+    if confirm "Replace it with the toolkit's version?"; then
+      cp "$TEMPLATE" "$WORKFLOW_PATH"
+      ok "Updated. Commit it with: git commit -am 'Update iOS build workflow'"
+    fi
+  fi
+}
+
+usage() {
+  cat <<EOF
+ios-cloud $VERSION: build iOS apps on a free GitHub Mac, install them with a free Apple ID.
+
+Usage: ios-cloud <command> [options]
+
+  init [--private] [--no-dev-client] [--no-repo] [--force] [--dry-run] [-m msg]
+                        Set up the current Expo/React Native project and its GitHub repo
+  run [release|dev]     Build in the cloud, download, install (and launch) on your iPhone
+  build [release|dev]   Build in the cloud and download the .ipa to $OUT_DIR/
+  wait <run-id>         Resume watching a build and download it
+  install [file.ipa]    Install the latest (or given) .ipa. Re-run every 7 days to renew it
+  doctor                Check that everything is set up
+  update                Update the toolkit (and offer to refresh the project's workflow)
+  version               Print the version
+
+release = standalone app with the JavaScript inside.
+dev     = Expo development build; after installing, run 'npx expo start' and edit live.
+
+Environment:
+  IOS_CLOUD_INSTALLER   xtool | plumesign | wsl | manual (default: first one found)
+  IOS_CLOUD_PLUMESIGN   path to plumesign(.exe) if it isn't on PATH
+  IOS_CLOUD_RETRIES     network retries (default 3)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    init) cmd_init "$@" ;;
+    run) cmd_run "$@" ;;
+    build) cmd_build "$@" ;;
+    wait) cmd_wait "$@" ;;
+    install) cmd_install "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    update) cmd_update "$@" ;;
+    version|--version|-v) echo "ios-cloud $VERSION" ;;
+    help|--help|-h) usage ;;
+    *) fail "Unknown command: $cmd"; echo; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

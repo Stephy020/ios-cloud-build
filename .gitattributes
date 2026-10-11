@@ -1,0 +1,3 @@
+# Keep LF line endings on Windows clones; bash can't run scripts with CRLF.
+* text=auto eol=lf
+*.png binary
