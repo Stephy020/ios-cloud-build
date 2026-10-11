@@ -147,7 +147,8 @@ ensure_bundle_id() {
   bid=$(expo_bundle_id)
   if [ -n "$bid" ]; then ok "Bundle identifier: $bid"; return 0; fi
   [ -f app.json ] || die "Set ios.bundleIdentifier in your app config (e.g. \"com.yourname.myapp\"), then run init again."
-  owner=$(gh api user --jq .login 2>/dev/null || echo "${USER:-${USERNAME:-me}}")
+  # On failure gh prints the error body to stdout, so only trust the output on success.
+  owner=$(gh api user --jq .login 2>/dev/null) || owner="${USER:-${USERNAME:-me}}"
   owner=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
   slug=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
   bid="com.${owner:-me}.${slug:-app}"
@@ -528,7 +529,7 @@ cmd_run() {
 }
 
 cmd_doctor() {
-  local problems=0 installer devices os
+  local problems=0 installer devices os login
   if is_windows; then os="Windows (Git Bash)"; else os=$(uname -s); fi
   echo "${BOLD}ios-cloud $VERSION${RESET} on $os"
   echo "${DIM}toolkit: $IOS_CLOUD_HOME${RESET}"
@@ -542,7 +543,8 @@ cmd_doctor() {
   elif ! gh auth status >/dev/null 2>&1; then
     fail "GitHub CLI isn't logged in. Run: gh auth login -s workflow"; problems=$((problems + 1))
   else
-    ok "GitHub: logged in as $(gh api user --jq .login 2>/dev/null || echo '?')"
+    login=$(gh api user --jq .login 2>/dev/null) || login="(a token that can't read the user)"
+    ok "GitHub: logged in as $login"
     if ! gh_has_workflow_scope; then
       fail "Your GitHub login can't push workflow files. Run: gh auth refresh -s workflow"; problems=$((problems + 1))
     fi

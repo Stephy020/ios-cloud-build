@@ -63,7 +63,7 @@ jobs:
           ios-cloud init --no-repo --no-dev-client
           ios-cloud init --no-repo --no-dev-client   # second run must change nothing
           test -f .github/workflows/ios-build.yml
-          node -e 'const id = require("./app.json").expo.ios.bundleIdentifier; console.log("bundle id:", id); if (!id) process.exit(1)'
+          node -e 'const id = require("./app.json").expo.ios.bundleIdentifier; console.log("bundle id:", id); if (!/^com\.[a-z0-9]{1,39}\.sample$/.test(id || "")) process.exit(1)'
           grep -qx 'build/' .gitignore && grep -qx '/ios' .gitignore
           test "$(git log --oneline | wc -l)" -eq 1
           git status --porcelain | wc -l | grep -qx 0

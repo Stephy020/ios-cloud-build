@@ -15,6 +15,8 @@ ios-cloud run ──git push──▶  builds an UNSIGNED .ipa  ──download�
 
 ## One-time setup
 
+Install the toolkit **once per computer**. It's a global `ios-cloud` command that works in every project. Each project then needs `ios-cloud init` just once.
+
 ### Linux
 
 1. Install [Node.js](https://nodejs.org) 22+, git, and the [GitHub CLI](https://github.com/cli/cli/releases) (`gh`).
@@ -28,20 +30,7 @@ ios-cloud run ──git push──▶  builds an UNSIGNED .ipa  ──download�
 
 ### Windows (Git Bash, no WSL)
 
-1. Install [Git for Windows](https://git-scm.com/download/win), which includes Git Bash. Then in PowerShell or Git Bash:
-   ```bash
-   winget install OpenJS.NodeJS.LTS
-   winget install --id GitHub.cli
-   ```
-2. Install **iTunes** from apple.com. It provides the iPhone USB driver.
-3. Download **plumesign** (the command-line tool of [Impactor](https://github.com/claration/Impactor/releases)) for your CPU, for example `plumesign-windows-x86_64.exe`. Save it as `C:\Users\<you>\bin\plumesign.exe`.
-4. Open a **new** Git Bash window and run:
-   ```bash
-   git clone https://github.com/Stephy020/ios-cloud-build ~/ios-cloud-build
-   ~/ios-cloud-build/install.sh
-   gh auth login -s workflow
-   plumesign account login -u you@example.com     # your Apple ID
-   ```
+Follow the step-by-step **[Windows guide](docs/WINDOWS.md)**. In short: Git for Windows, Node.js, GitHub CLI, iTunes from apple.com (for the iPhone USB driver), Impactor's `plumesign.exe` in `~/bin`, then the same two install commands as on Linux. Use **Windows Terminal** with a Git Bash tab: the old Git Bash window can't show `gh`'s and plumesign's prompts.
 
 Prefer the Impactor app (GUI)? Skip plumesign. `ios-cloud install` will then open the folder with the `.ipa`, and you drag it into Impactor. If you already use xtool inside WSL, ios-cloud can use that too (`IOS_CLOUD_INSTALLER=wsl`).
 
